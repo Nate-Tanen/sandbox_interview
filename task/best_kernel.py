@@ -34,7 +34,7 @@ torch::Tensor naive_gemm_cpu(torch::Tensor A, torch::Tensor B) {
             for (int64_t k = 0; k < N; ++k) {
                 acc += a_ptr[row * N + k] * b_ptr[k * N + col];
             }
-            c_ptr[row * N + col] = acc; // Correct assignment instead of +=
+            c_ptr[row * N + col] = acc;
         }
     }
 
@@ -43,8 +43,8 @@ torch::Tensor naive_gemm_cpu(torch::Tensor A, torch::Tensor B) {
 """
 
 
-NAIVE_GEMM = load_inline(
-    name="candidate_gemm_extension",
+BEST_GEMM = load_inline(
+    name="best_gemm_extension",
     cpp_sources=[CPP_SOURCE],
     functions=["naive_gemm_cpu"],
     extra_cflags=["-O0"],
@@ -56,13 +56,12 @@ NAIVE_GEMM = load_inline(
 
 class ModelNew(nn.Module):
     """
-    Staging area for the latest proposed kernel from the agent.
-
-    Run the evaluator against this file; on success it can be copied to best_kernel.py.
+    Same naive C++ as `task/base_kernel.py`. Promotion to this file requires beating the
+    profiled naive baseline (~202 ms mean for this implementation), not torch.matmul.
     """
 
     def __init__(self):
         super().__init__()
 
     def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        return NAIVE_GEMM.naive_gemm_cpu(A, B)
+        return BEST_GEMM.naive_gemm_cpu(A, B)

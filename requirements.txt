@@ -1,3 +1,7 @@
 numpy
 psutil
 ninja
+openai-agents
+python-dotenv
+pydantic
+streamlit
