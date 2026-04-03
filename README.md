@@ -2,11 +2,7 @@
 
 This directory is a standalone take-home interview focused on sandbox and agent setup for local C++ matmul optimization.
 
-## What this README is for
-
-This document walks through the implementation: the single-turn kernel improver loop, the optional manager session that runs many improvement cycles in parallel over several rounds, guardrails and why they exist, how the offline evaluator is wired (including isolated evaluation for parallel manager branches), how `kernel_history/` relates to promotion in `task/best_kernel.py`, and what the Streamlit UI adds compared to the REPL. The diagrams under `Diagram Images/` (`IMG_0038.jpg`, `IMG_0039.jpg`) sketch the improvement cycle and manager workflow. The focus is workflow and design tradeoffs, not chasing the fastest possible kernel for its own sake.
-
-## Goal (interview brief)
+## Goal
 
 Set up an agent or sandboxed workflow that can take the provided C++ matmul task, iterate on the candidate implementation, and improve it while preserving correctness.
 
