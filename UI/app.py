@@ -13,6 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import manager_run
+
 from main import (
     GuardrailRetriesExhausted,
     apply_generation_to_task_files,
@@ -20,7 +22,7 @@ from main import (
     cpp_matches_best_kernel,
     should_save_kernel_history,
     get_model_name,
-    get_top_k_summary_context,
+    get_summary_context_for_filenames,
     init_env,
     list_saved_kernel_files,
     load_baseline_cpp,
@@ -31,17 +33,57 @@ from main import (
     working_kernel_task_relpath,
 )
 
-# Default for newest-K summary context (overridden by sidebar `summary_context_k`).
-_DEFAULT_SUMMARY_K = 3
 _DEFAULT_GUARD_RETRIES = 3
-
-
-def _summary_context_k() -> int:
-    return int(st.session_state.get("summary_context_k", _DEFAULT_SUMMARY_K))
+_DEFAULT_NUM_CAP = 4
+_DEFAULT_NUM_PARALLEL = 2
+_DEFAULT_NUM_RUNS = 3
 
 
 def _guardrail_max_retries() -> int:
     return int(st.session_state.get("guardrail_max_retries", _DEFAULT_GUARD_RETRIES))
+
+
+def _manager_seed_token_options() -> list[str]:
+    return ["session", "working", "baseline"] + [
+        f"file:{f}" for f in list_saved_kernel_files("recent")
+    ]
+
+
+def _label_manager_seed_token(t: str) -> str:
+    if t == "session":
+        return "Current session kernel (chat)"
+    if t == "working":
+        return f"On-disk working · `{working_kernel_task_relpath()}`"
+    if t == "baseline":
+        return "Baseline · `task/base_kernel.py`"
+    if t.startswith("file:"):
+        return f"Saved · `{t[5:]}`"
+    return t
+
+
+def resolve_manager_seed_cpps() -> list[str]:
+    """Deduped C++ list from sidebar token selection (session, working, baseline, saved files)."""
+    tokens: list[str] = list(st.session_state.get("manager_seed_tokens") or ["working"])
+    out: list[str] = []
+    for t in tokens:
+        if t == "session":
+            out.append(st.session_state.current_cpp)
+        elif t == "working":
+            out.append(load_working_cpp())
+        elif t == "baseline":
+            out.append(load_baseline_cpp())
+        elif t.startswith("file:"):
+            fn = t[5:].strip()
+            out.append(load_saved_kernel_revision(fn).cpp_code)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for cpp in out:
+        key = cpp.strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cpp)
+    return deduped
 
 
 def working_kernel_tab_label() -> str:
@@ -66,6 +108,16 @@ def init_state() -> None:
         st.session_state.run_in_progress = False
     if "open_working_kernel_tab" not in st.session_state:
         st.session_state.open_working_kernel_tab = False
+    if "manager_log" not in st.session_state:
+        st.session_state.manager_log = []
+    if "manager_last_result" not in st.session_state:
+        st.session_state.manager_last_result = None
+    if "manager_run_in_progress" not in st.session_state:
+        st.session_state.manager_run_in_progress = False
+    if "chat_memory_files" not in st.session_state:
+        st.session_state.chat_memory_files = []
+    if "manager_seed_tokens" not in st.session_state:
+        st.session_state.manager_seed_tokens = ["working"]
 
 
 def render_message(msg: dict) -> None:
@@ -75,13 +127,18 @@ def render_message(msg: dict) -> None:
             return
 
         if msg.get("type") == "guardrail_error":
-            st.warning(msg.get("summary", "Guardrail blocked this generation."))
+            st.warning(msg.get("summary", "Injection guardrail blocked this generation."))
             if msg.get("tab_label"):
                 st.caption(f"Details are in the **{msg['tab_label']}** tab.")
             return
 
         st.markdown("**Explanation**")
         st.write(msg["explanation"])
+        if msg.get("web_research_used"):
+            st.caption(
+                "Internal **web research** ran once this turn (agent-decided). "
+                "Not controlled by your prompt; at most one search per message."
+            )
         with st.expander("Generated C++", expanded=True):
             st.code(msg["cpp_code"], language="cpp")
 
@@ -330,8 +387,8 @@ def render_rejection_tab(rej: dict) -> None:
             st.rerun()
     st.error(f"**Last reason:** {rej['last_reason']}")
     st.caption(
-        "Each attempt below was rejected by the guardrail (static denylist or LLM guardrail). "
-        "Regenerate without repeating these patterns."
+        "Each attempt below was rejected by the **injection guardrail** (static host-escape patterns "
+        "and/or GUARDRAIL_AGENT). This does not police normal GEMM APIs—fix injection issues or ambiguity."
     )
 
     raw_attempts = rej.get("attempts", [])
@@ -373,30 +430,38 @@ def render_past_kernels_tab() -> None:
     sort_label = st.session_state.get("kernel_sort", "Most recent")
     sort_key = "recent" if sort_label == "Most recent" else "fastest"
     saved_files = list_saved_kernel_files(sort_key)
-    k = _summary_context_k()
+    mem = set(st.session_state.get("chat_memory_files") or [])
     st.caption(
-        f"Sort order matches the sidebar. Open a file in its own tab to inspect summary + code. "
-        f"**K = {k}**: the **{k} newest** saved kernels’ summaries are used as agent context — ⭐ marks those (by recency, not sort order here)."
+        "Sort order matches the sidebar. Open a file in its own tab to inspect summary + code. "
+        "⭐ marks kernels you selected for **chat memory** (summaries in the next chat message) — "
+        "use **Single kernel implementation cycle → Choose memory** in the sidebar."
     )
     if not saved_files:
         st.info("No saved kernels yet.")
         return
 
-    top_set = set(list_saved_kernel_files("recent")[:k])
-
     for filename in saved_files:
         cols = st.columns([4, 1, 1])
         display = kernel_display_meta(filename)
         with cols[0]:
-            prefix = "⭐ " if filename in top_set else ""
+            prefix = "⭐ " if filename in mem else ""
             st.markdown(f"{prefix}`{display['label']}`")
         with cols[1]:
-            if st.button("Open tab", key=f"past-open-{filename}", help=display["tooltip"]):
+            if st.button(
+                "Open tab",
+                key=f"past-open-{filename}",
+                help=display["tooltip"],
+                disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
+            ):
                 if filename not in st.session_state.open_summary_tabs:
                     st.session_state.open_summary_tabs.append(filename)
                 st.rerun()
         with cols[2]:
-            if st.button("Use kernel", key=f"past-use-{filename}"):
+            if st.button(
+                "Use kernel",
+                key=f"past-use-{filename}",
+                disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
+            ):
                 saved = load_saved_kernel_revision(filename)
                 st.session_state.current_cpp = saved.cpp_code
                 st.session_state.messages.append(
@@ -410,13 +475,163 @@ def render_past_kernels_tab() -> None:
                 st.rerun()
 
 
+def _render_manager_last_run_panel() -> None:
+    """
+    Always rendered *below* the tab strip so output survives tab switches.
+
+    Streamlit may not execute inactive `st.tabs` panels on a rerun; if the user switches
+    to Past kernels or a kernel preview tab, the Manager tab body would not run and would
+    look empty. Session state still holds results — we mirror them here every run.
+    """
+    res = st.session_state.get("manager_last_result")
+    log_lines = st.session_state.get("manager_log") or []
+    if not res and not log_lines:
+        return
+    st.divider()
+    st.markdown("### Last manager run")
+    st.caption(
+        "This block is **outside** the tab strip so it stays on screen when you open other tabs "
+        "(e.g. Past kernels or a saved kernel preview) while a run finishes or afterward."
+    )
+    if res:
+        st.success(
+            f"Saved `{res.get('saved_kernel_history') or 'nothing'}` · "
+            f"successful branches (session): {res.get('total_success_branches', 0)}"
+        )
+        if res.get("saved_kernel_history"):
+            st.caption(
+                "Reload **Past kernels** for the new file. `task/candidate.py` / `best_kernel.py` "
+                "were updated from the global best."
+            )
+    with st.expander("Manager session log (last run)", expanded=False):
+        if log_lines:
+            st.code("\n".join(log_lines), language="text")
+        else:
+            st.caption("No log lines for the last session.")
+
+
+def render_manager_tab(agent) -> None:
+    st.markdown("### Autonomous manager session")
+    st.caption(
+        "Runs **NUM_RUNS** rounds. Each round asks the manager model for **NUM_PARALLEL** prompts, "
+        "then runs that many improvement cycles in parallel (isolated eval). "
+        "Context is **seed + prior run winners**, sorted fastest-first, capped at **NUM_CAP**. "
+        "At the end, **one** entry is appended to `kernel_history/` — the single fastest correct kernel "
+        "from the whole session (if any). "
+        "**Results and log** also appear under **Last manager run** below the tabs so they stay visible "
+        "when you switch to another tab."
+    )
+    idea = st.text_area(
+        "Goal / idea for the manager",
+        height=120,
+        key="manager_user_idea",
+        placeholder="e.g. Explore cache-friendly blocking and k-dimension ordering…",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        run_btn = st.button(
+            "Run manager session",
+            type="primary",
+            disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
+            key="manager_run_btn",
+        )
+    with c2:
+        if st.button("Clear manager log", key="manager_clear_log"):
+            st.session_state.manager_log = []
+            st.session_state.manager_last_result = None
+            st.rerun()
+
+    if run_btn:
+        if not (idea or "").strip():
+            st.warning("Enter a goal for the manager.")
+        else:
+            st.session_state.run_in_progress = True
+            st.session_state.manager_run_in_progress = True
+            st.session_state.manager_log = []
+            st.session_state.manager_last_result = None
+
+            seed_cpps = resolve_manager_seed_cpps()
+            cap = int(st.session_state.get("manager_num_cap", _DEFAULT_NUM_CAP))
+            npar = int(st.session_state.get("manager_num_parallel", _DEFAULT_NUM_PARALLEL))
+            nruns = int(st.session_state.get("manager_num_runs", _DEFAULT_NUM_RUNS))
+            gr = _guardrail_max_retries()
+
+            progress = st.progress(0.0, text="Starting…")
+            status = st.empty()
+
+            def log_fn(line: str) -> None:
+                st.session_state.manager_log.append(line)
+
+            def on_progress(*, phase: str = "", run_idx: int = 0, num_runs: int = 1, detail: str = "") -> None:
+                nr = max(int(num_runs), 1)
+                ri = int(run_idx)
+                if phase == "seed_eval":
+                    p = 0.04
+                    label = detail or "Evaluating seed kernel(s) (isolated) for ordering…"
+                elif phase == "manager_llm":
+                    base = (ri - 1) / nr if ri else 0.0
+                    p = min(0.05 + base * 0.72, 0.77)
+                    label = f"Run {ri}/{nr}: manager LLM — {detail}"
+                elif phase == "parallel_cycles":
+                    base = (ri - 1) / nr if ri else 0.0
+                    p = min(0.12 + base * 0.72, 0.82)
+                    label = f"Run {ri}/{nr}: parallel improvement + eval — {detail}"
+                elif phase == "run_done":
+                    p = min(0.18 + (ri / nr) * 0.7, 0.88)
+                    label = f"Run {ri}/{nr}: round complete"
+                elif phase == "save":
+                    p = 0.93
+                    label = "Saving global best to kernel_history…"
+                elif phase == "done":
+                    p = 1.0
+                    label = "Manager session finished"
+                else:
+                    p, label = 0.1, f"{phase} {detail}"
+                progress.progress(min(float(p), 1.0), text=label[:120])
+                status.markdown(f"**{label}**")
+
+            try:
+                result = asyncio.run(
+                    manager_run.run_manager_session(
+                        seed_kernel_cpps=seed_cpps,
+                        user_idea=idea.strip(),
+                        num_parallel=npar,
+                        num_runs=nruns,
+                        num_cap=cap,
+                        max_retries=gr,
+                        kernel_agent=agent,
+                        log=log_fn,
+                        on_progress=on_progress,
+                    )
+                )
+                st.session_state.manager_last_result = result
+            except Exception as exc:
+                st.session_state.manager_log.append(f"[error] {exc}")
+                st.error(f"Manager session failed: {exc}")
+            finally:
+                st.session_state.run_in_progress = False
+                st.session_state.manager_run_in_progress = False
+            st.rerun()
+
+
+def render_manager_log_tab() -> None:
+    st.markdown("### Manager debug log")
+    st.caption("Full stdout-style log from the last manager sessions this browser session.")
+    lines = st.session_state.get("manager_log") or []
+    if lines:
+        st.code("\n".join(lines), language="text")
+    else:
+        st.info("Empty — run a manager session from the **Manager** tab.")
+
+
 def main() -> None:
     init_env()
     st.set_page_config(page_title="Kernel Agent UI", page_icon="UI", layout="wide")
     st.title("Kernel Agent")
     st.caption(
         "Chat with the kernel optimization agent. Type **reset** in chat to restart from baseline. "
-        "Use the sidebar to set **K** (prior summaries) and **guardrail retries**."
+        "Optional **chat memory** (saved kernels’ summaries) is chosen in the sidebar; **guardrail retries** "
+        "are under global settings. The model may run **web research** at most once per reply (its own choice)."
     )
 
     model_name = get_model_name()
@@ -426,39 +641,122 @@ def main() -> None:
     with st.sidebar:
         st.subheader("Session")
         st.write(f"Model: `{model_name}`")
-        if st.button("Reset to baseline", use_container_width=True, disabled=st.session_state.run_in_progress):
+        if st.button(
+            "Reset to baseline",
+            use_container_width=True,
+            disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
+        ):
             st.session_state.current_cpp = load_baseline_cpp()
             st.session_state.messages = []
             st.session_state.open_summary_tabs = []
             st.session_state.rejection_tabs = []
             st.session_state.open_working_kernel_tab = False
             st.session_state.run_in_progress = False
+            st.session_state.manager_run_in_progress = False
             st.rerun()
         wrel = working_kernel_task_relpath()
         if st.button(
             f"Open current best kernel · `{wrel}`",
             key="open-working-kernel-preview",
             use_container_width=True,
-            disabled=st.session_state.run_in_progress,
+            disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
         ):
             st.session_state.open_working_kernel_tab = True
             st.rerun()
-        st.number_input(
-            "Prior summaries (K)",
-            min_value=1,
-            max_value=50,
-            value=_DEFAULT_SUMMARY_K,
-            key="summary_context_k",
-            help="Number of newest `kernel_history` summaries injected into each agent turn.",
-        )
+
+        st.divider()
+        st.subheader("Global settings")
         st.number_input(
             "Guardrail max retries",
             min_value=1,
             max_value=20,
             value=_DEFAULT_GUARD_RETRIES,
             key="guardrail_max_retries",
-            help="How many times to regenerate when the reward-hacking guardrail blocks output.",
+            help="Applies to **Kernel Agent Chat** and **Manager** runs. Regenerations when the injection guardrail (static + GUARDRAIL_AGENT) blocks output.",
         )
+
+        st.divider()
+        st.subheader("Single kernel implementation cycle")
+        st.caption(
+            "Optional **prior summaries** from `kernel_history/` — not the full C++ unless you open a tab."
+        )
+        n_mem = len(st.session_state.get("chat_memory_files") or [])
+        st.markdown(
+            f"**Chat memory:** {n_mem} saved kernel(s) selected"
+            if n_mem
+            else "**Chat memory:** none (only the current kernel in chat)"
+        )
+        with st.popover("Choose memory…", use_container_width=True):
+            st.markdown("##### Kernel memory for chat")
+            st.caption(
+                "Pick any number of saved kernels. Their **summaries** are added to the next agent turn "
+                "(order follows filename sort: **newest saved files first** among your picks)."
+            )
+            mem_files = list_saved_kernel_files("recent")
+            valid_cur = [f for f in (st.session_state.get("chat_memory_files") or []) if f in mem_files]
+            pick = st.multiselect(
+                "kernel_history",
+                options=mem_files,
+                default=valid_cur,
+                disabled=not mem_files,
+                label_visibility="collapsed",
+            )
+            if not mem_files:
+                st.info("No saved kernels yet — run chat once with a successful eval, or use Manager.")
+            if st.button("Apply selection", type="primary", key="apply_chat_memory"):
+                st.session_state.chat_memory_files = pick
+                st.rerun()
+
+        st.divider()
+        st.subheader("Manager session")
+        st.caption("Autonomous multi-run optimizer — see **Manager** tab.")
+        st.number_input(
+            "NUM_CAP",
+            min_value=1,
+            max_value=32,
+            value=_DEFAULT_NUM_CAP,
+            key="manager_num_cap",
+            help="Max kernels in manager context: seed + run winners, fastest first, then capped.",
+        )
+        st.number_input(
+            "NUM_PARALLEL",
+            min_value=1,
+            max_value=16,
+            value=_DEFAULT_NUM_PARALLEL,
+            key="manager_num_parallel",
+            help="Parallel improvement cycles per run (each gets an isolated evaluator build).",
+        )
+        st.number_input(
+            "NUM_RUNS",
+            min_value=1,
+            max_value=50,
+            value=_DEFAULT_NUM_RUNS,
+            key="manager_num_runs",
+            help="How many manager rounds in one session.",
+        )
+        n_tok = len(st.session_state.get("manager_seed_tokens") or [])
+        st.markdown(f"**Seed kernels:** {n_tok} source(s) selected")
+        with st.popover("Choose seed kernels…", use_container_width=True):
+            st.markdown("##### Seeds for manager context")
+            st.caption(
+                "Each seed is evaluated once for timing, then combined with per-run winners (fastest first, "
+                "capped by NUM_CAP). Include session, on-disk working, baseline, and/or any saved revision."
+            )
+            opt_keys = _manager_seed_token_options()
+            cur = [x for x in (st.session_state.get("manager_seed_tokens") or ["working"]) if x in opt_keys]
+            mgr_pick = st.multiselect(
+                "Sources",
+                options=opt_keys,
+                default=cur,
+                format_func=_label_manager_seed_token,
+                label_visibility="collapsed",
+            )
+            if st.button("Apply seeds", type="primary", key="apply_manager_seeds"):
+                if not mgr_pick:
+                    st.warning("Select at least one seed.")
+                else:
+                    st.session_state.manager_seed_tokens = mgr_pick
+                    st.rerun()
 
         st.divider()
         st.subheader("Saved kernels")
@@ -476,26 +774,26 @@ def main() -> None:
             f"✅ Current best kernel · `{wrel_saved}`",
             key="sidebar-working-kernel",
             use_container_width=True,
-            disabled=st.session_state.run_in_progress,
+            disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
         ):
             st.session_state.open_working_kernel_tab = True
             st.rerun()
         if not saved_files:
             st.caption("No saved revisions yet.")
         else:
-            k_ctx = _summary_context_k()
-            top_k_files = set(list_saved_kernel_files("recent")[:k_ctx])
+            mem_set = set(st.session_state.get("chat_memory_files") or [])
             st.caption(
-                f"**K = {k_ctx}**: the **{k_ctx} newest** saved kernels’ summaries are included in the agent prompt each turn — ⭐ highlights them."
+                "⭐ = in **chat memory** (summaries for the next chat message). "
+                "Configure under **Single kernel implementation cycle**."
             )
             for filename in saved_files:
                 display = kernel_display_meta(filename)
-                label = f"⭐ {display['label']}" if filename in top_k_files else display["label"]
+                label = f"⭐ {display['label']}" if filename in mem_set else display["label"]
                 if st.button(
                     label,
                     key=f"open-{filename}",
                     use_container_width=True,
-                    disabled=st.session_state.run_in_progress,
+                    disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
                     help=display["tooltip"],
                 ):
                     if filename not in st.session_state.open_summary_tabs:
@@ -507,7 +805,7 @@ def main() -> None:
     working_tab_label = working_kernel_tab_label()
     show_working_tab = bool(st.session_state.get("open_working_kernel_tab"))
     tab_names = (
-        ["Kernel Agent Chat", "Past kernels"]
+        ["Kernel Agent Chat", "Past kernels", "Manager", "Manager log"]
         + rejection_labels
         + ([working_tab_label] if show_working_tab else [])
         + open_tab_labels
@@ -518,7 +816,10 @@ def main() -> None:
         for msg in st.session_state.messages:
             render_message(msg)
 
-        prompt = st.chat_input("Ask the agent to improve the kernel...")
+        prompt = st.chat_input(
+            "Ask the agent to improve the kernel...",
+            disabled=st.session_state.run_in_progress or st.session_state.manager_run_in_progress,
+        )
         if prompt:
             if prompt.strip().lower() == "reset":
                 st.session_state.current_cpp = load_baseline_cpp()
@@ -527,6 +828,7 @@ def main() -> None:
                 st.session_state.rejection_tabs = []
                 st.session_state.open_working_kernel_tab = False
                 st.session_state.run_in_progress = False
+                st.session_state.manager_run_in_progress = False
                 st.rerun()
 
             user_msg = {"role": "user", "content": prompt}
@@ -539,20 +841,23 @@ def main() -> None:
                 kernel_for_run = st.session_state.current_cpp
                 st.session_state.run_in_progress = True
                 try:
-                    k_ctx = _summary_context_k()
                     gr = _guardrail_max_retries()
-                    status.info(
-                        f"Loading summaries for the {k_ctx} newest kernels (prior prompt context)…"
-                    )
-                    summaries = asyncio.run(get_top_k_summary_context(k=k_ctx))
+                    mem_names = list(st.session_state.get("chat_memory_files") or [])
+                    if mem_names:
+                        status.info(
+                            f"Loading summaries from {len(mem_names)} selected kernel(s) (chat memory)…"
+                        )
+                    else:
+                        status.info("No chat memory selected — using current kernel only…")
+                    summaries = asyncio.run(get_summary_context_for_filenames(mem_names))
                     progress.progress(30, text="Running kernel agent...")
                     status.info(f"Generating candidate kernel (guardrail retries ≤ {gr})…")
-                    revision = asyncio.run(
+                    revision, turn_ctx = asyncio.run(
                         run_kernel_turn(
-                            agent,
                             prompt,
                             kernel_for_run,
                             prior_summaries=summaries,
+                            agent=agent,
                             max_retries=gr,
                         )
                     )
@@ -613,7 +918,7 @@ def main() -> None:
                             "role": "assistant",
                             "type": "guardrail_error",
                             "summary": (
-                                f"Guardrail blocked this generation after {num_attempts} "
+                                f"Injection guardrail blocked this generation after {num_attempts} "
                                 f"attempt{'s' if num_attempts != 1 else ''}."
                             ),
                             "tab_label": tab_label,
@@ -640,6 +945,7 @@ def main() -> None:
                     "promoted": promoted,
                     "eval_error": eval_error,
                     "eval_skipped": eval_skipped,
+                    "web_research_used": turn_ctx.web_research_consumed,
                 }
                 st.session_state.messages.append(assistant_msg)
                 st.markdown("**Explanation**")
@@ -656,7 +962,13 @@ def main() -> None:
     with tabs[1]:
         render_past_kernels_tab()
 
-    rej_idx = 2
+    with tabs[2]:
+        render_manager_tab(agent)
+
+    with tabs[3]:
+        render_manager_log_tab()
+
+    rej_idx = 4
     for rej in st.session_state.rejection_tabs:
         with tabs[rej_idx]:
             render_rejection_tab(rej)
@@ -671,6 +983,8 @@ def main() -> None:
         with tabs[rej_idx]:
             render_summary_tab(filename)
         rej_idx += 1
+
+    _render_manager_last_run_panel()
 
 
 if __name__ == "__main__":

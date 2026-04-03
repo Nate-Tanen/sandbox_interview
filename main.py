@@ -105,6 +105,78 @@ def evaluate_candidate_kernel_sync() -> dict:
     )
 
 
+def _sanitize_isolate_key(isolate_key: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", isolate_key.strip())
+    return cleaned[:64] if cleaned else "iso"
+
+
+def build_candidate_module_source(
+    cpp: str,
+    *,
+    extension_name: str,
+    inline_build_directory: Path,
+) -> str:
+    """
+    Build `task/candidate.py`-shaped source with a unique `load_inline` name and build dir
+    so parallel manager evaluations do not clobber each other or `task/candidate.py`.
+    """
+    body = cpp.rstrip()
+    if '"""' in body:
+        raise ValueError('Generated C++ must not contain the sequence """ in the source.')
+    safe_ext = re.sub(r"[^a-zA-Z0-9_]", "_", extension_name.strip())
+    if not safe_ext:
+        safe_ext = "candidate_gemm_extension"
+    if safe_ext[0].isdigit():
+        safe_ext = "ext_" + safe_ext
+    bd = str(inline_build_directory.resolve())
+    return (
+        "import torch\n"
+        "import torch.nn as nn\n"
+        "from torch.utils.cpp_extension import load_inline\n\n\n"
+        f'CPP_SOURCE = r"""\n{body}\n"""\n\n\n'
+        "NAIVE_GEMM = load_inline(\n"
+        f'    name="{safe_ext}",\n'
+        "    cpp_sources=[CPP_SOURCE],\n"
+        '    functions=["naive_gemm_cpu"],\n'
+        '    extra_cflags=["-O0"],\n'
+        "    with_cuda=False,\n"
+        "    verbose=False,\n"
+        f"    build_directory={json.dumps(bd)},\n"
+        ")\n\n\n"
+        "class ModelNew(nn.Module):\n"
+        '    """Staging model for evaluator (isolated build)."""\n\n'
+        "    def __init__(self):\n"
+        "        super().__init__()\n\n"
+        "    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:\n"
+        "        return NAIVE_GEMM.naive_gemm_cpu(A, B)\n"
+    )
+
+
+def evaluate_candidate_cpp_isolated(cpp: str, isolate_key: str) -> dict:
+    """
+    Evaluate arbitrary C++ as if it were `task/candidate.py`, using a dedicated build root
+    and unique extension name so concurrent runs stay isolated.
+    """
+    root = project_root()
+    ref = (root / "task" / "reference.py").read_text(encoding="utf-8")
+    safe = _sanitize_isolate_key(isolate_key)
+    ext_name = f"iso_{safe}"[:80]
+    build_parent = root / "build" / "eval_iso" / safe
+    build_parent.mkdir(parents=True, exist_ok=True)
+    cand_src = build_candidate_module_source(
+        cpp,
+        extension_name=ext_name,
+        inline_build_directory=build_parent,
+    )
+    return evaluate_sources(
+        ref_src=ref,
+        candidate_src=cand_src,
+        build_root=build_parent,
+        num_trials=10,
+        seed_num=42,
+    )
+
+
 # Mean time (ms) for task/base_kernel.py naive GEMM under evaluate_sources (reference=torch.matmul).
 # Profile once if N/flags change: python -c "..."  # see README or prior chat snippet
 NAIVE_BASELINE_TIME_MS = 202.124
@@ -312,6 +384,24 @@ async def get_top_k_summary_context(k: int = 3) -> list[str]:
     return lines
 
 
+async def get_summary_context_for_filenames(filenames: list[str]) -> list[str]:
+    """
+    Load (or generate) kernel summaries for the given `kernel_history/*.md` names.
+    Order: **newest file first** (mtime), regardless of multiselect order.
+    """
+    paths: list[Path] = []
+    for name in filenames:
+        path = storage_dir() / name
+        if path.is_file():
+            paths.append(path)
+    paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    lines: list[str] = []
+    for path in paths:
+        summary = await _ensure_summary_on_file(path)
+        lines.append(_render_summary_for_prompt(summary))
+    return lines
+
+
 async def save_kernel_revision_with_summary(
     revision: KernelRevision,
     user_request: str,
@@ -389,7 +479,6 @@ async def main() -> None:
     init_env()
 
     current_cpp = load_working_cpp()
-    agent = build_agent()
 
     while True:
         try:
@@ -405,8 +494,7 @@ async def main() -> None:
 
         prior_summaries = await get_top_k_summary_context(k=3)
         try:
-            revision = await run_kernel_turn(
-                agent,
+            revision, _turn_ctx = await run_kernel_turn(
                 user_line,
                 current_cpp,
                 prior_summaries=prior_summaries,

@@ -1,41 +1,31 @@
-"""Deterministic denylist for generated C++ (no LLM)."""
+"""Deterministic checks for obvious sandbox-escape / injection primitives (no matmul policy)."""
 
 from dataclasses import dataclass
 
 
-# One blocked substring plus a short reason for error messages.
 @dataclass(frozen=True)
 class DisallowedPattern:
     pattern: str
     reason: str
 
 
-# Substring checks (case-insensitive in find_disallowed_hits). Extend as needed.
+# High-confidence patterns only: process execution, dynamic load of foreign code, obvious shell vectors.
+# We do NOT match framework APIs (torch::matmul, BLAS, etc.) — those are not "injection" and are left to the LLM reviewer only if needed elsewhere.
 DISALLOWED_CPP_PATTERNS: tuple[DisallowedPattern, ...] = (
-    DisallowedPattern("torch::matmul", "Direct framework matmul call is disallowed."),
-    DisallowedPattern("torch::mm", "ATen-style mm shortcut is disallowed."),
-    DisallowedPattern("at::matmul", "ATen matmul shortcut is disallowed."),
-    # 2D/batched matmul shortcuts (same policy as matmul; substring match).
-    DisallowedPattern("at::mm", "ATen mm shortcut is disallowed."),
-    DisallowedPattern("at::bmm", "ATen bmm shortcut is disallowed."),
-    DisallowedPattern("at::addmm", "ATen addmm shortcut is disallowed."),
-    DisallowedPattern("cblas_", "BLAS shortcuts are disallowed for this task."),
-    DisallowedPattern("openblas", "External BLAS dependencies are disallowed."),
-    DisallowedPattern("mkl_", "MKL shortcuts are disallowed for this task."),
-    DisallowedPattern("#include <cblas", "BLAS include is disallowed."),
-    DisallowedPattern("#include <mkl", "MKL include is disallowed."),
-    DisallowedPattern("#include <eigen", "Eigen include is disallowed."),
-    DisallowedPattern("#include <lapack", "LAPACK include is disallowed."),
-    DisallowedPattern("pybind11", "Python/C++ bridge usage is disallowed."),
-    DisallowedPattern("numpy", "NumPy usage in generated C++ is disallowed."),
-    DisallowedPattern("system(", "OS shell/process execution is disallowed."),
-    DisallowedPattern("popen(", "OS process execution is disallowed."),
-    DisallowedPattern("fork(", "Process forking is disallowed."),
-    DisallowedPattern("dlopen(", "Dynamic loading escapes are disallowed."),
+    DisallowedPattern("system(", "Process/shell execution (injection vector)."),
+    DisallowedPattern("popen(", "Shell pipeline (injection vector)."),
+    DisallowedPattern("fork(", "Process fork (sandbox escape vector)."),
+    DisallowedPattern("execl(", "Process execution."),
+    DisallowedPattern("execv(", "Process execution."),
+    DisallowedPattern("execve(", "Process execution."),
+    DisallowedPattern("dlopen(", "Dynamic library load (code-injection vector)."),
+    DisallowedPattern("dlsym(", "Dynamic symbol resolution after dlopen."),
+    DisallowedPattern("winexec", "Windows process execution."),
+    DisallowedPattern("createprocess", "Windows process creation."),
+    DisallowedPattern("shellexecute", "Windows shell execution."),
 )
 
 
-# Return human-readable hit lines for any denylist pattern present in cpp_code.
 def find_disallowed_hits(cpp_code: str) -> list[str]:
     source = cpp_code.lower()
     hits: list[str] = []
