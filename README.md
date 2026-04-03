@@ -4,7 +4,7 @@ This directory is a standalone take-home interview focused on sandbox and agent 
 
 ## What this README is for
 
-This document describes **what we implemented**: how the **single-turn** kernel improver loop works end-to-end, how the optional **manager** (multi-run, parallel) session layers on top, **what guardrails exist and why**, how the **offline evaluator** is wired (including **isolated** eval for parallel branches), how **`kernel_history/`** and promotion to **`best_kernel.py`** behave, and what the **Streamlit UI** adds on top of the REPL. **Architecture diagrams** (`Diagram Images/IMG_0038.jpg`, `IMG_0039.jpg`) illustrate the **improvement cycle** and **manager workflow**. It is meant to explain **workflow and design choices**, not to optimize for the single fastest kernel. The interview cares about setup, safety, and reasoning—not peak benchmark scores.
+This document walks through the implementation: the single-turn kernel improver loop, the optional manager session that runs many improvement cycles in parallel over several rounds, guardrails and why they exist, how the offline evaluator is wired (including isolated evaluation for parallel manager branches), how `kernel_history/` relates to promotion in `task/best_kernel.py`, and what the Streamlit UI adds compared to the REPL. The diagrams under `Diagram Images/` (`IMG_0038.jpg`, `IMG_0039.jpg`) sketch the improvement cycle and manager workflow. The focus is workflow and design tradeoffs, not chasing the fastest possible kernel for its own sake.
 
 ## Goal (interview brief)
 
@@ -21,120 +21,120 @@ We are evaluating how well a candidate can:
 
 ## Architecture diagrams
 
-The system is split into two ideas: a **single improvement cycle** (one generate → guardrail → eval attempt, with retries) and a **manager workflow** (many cycles in parallel, many rounds, one best result at the end). Diagrams are shown **first**, then explained.
+Two concepts matter: a single **improvement cycle** (generate, guardrail checks, eval, with guardrail retries), and the **manager workflow** (many cycles in parallel, repeated rounds, one best artifact at the end of the session). Each subsection below shows the diagram first, then walks through it.
 
 ### Improvement cycle
 
-![Improvement cycle — context, MAIN_KERNEL_AGENT, guardrails, output or retry](Diagram%20Images/IMG_0038.jpg)
+![Improvement cycle diagram](Diagram%20Images/IMG_0038.jpg)
 
 **What the diagram shows**
 
 1. **Context** — The prompt bundles:
-   - **Past kernels** with **summaries** from **`SUMMARY_AGENT`** (structured tags, notes, high-level recap—not necessarily full C++ in the prompt unless you open a file).
-   - **Manager / user instructions** — What to try next (from chat, REPL, or a worker prompt inside a manager run).
-   - **Guardrail feedback** — When a candidate fails the injection checks, the next attempt receives the reasons and rejected snippets so the model can fix security issues without starting from scratch.
+   - **Past kernels** with **summaries** from **`SUMMARY_AGENT`**: tags, notes, and a short recap. The default prompt uses summaries, not full C++ bodies; you can open a saved file in the UI to read the full code.
+   - **Manager / user instructions** — What to try next, whether from chat, the REPL, or a worker prompt in a manager run.
+   - **Guardrail feedback** — If a candidate fails injection checks, the next attempt includes the reasons and rejected snippets so the model can revise without discarding the rest of the context.
 
-2. **`MAIN_KERNEL_AGENT`** — Produces a full **`KernelRevision`** (C++ + explanation). It may call **`research_algorithm_summary`** (web search) **at most once** per user message when it needs concrete technical grounding.
+2. **`MAIN_KERNEL_AGENT`** — Produces a full **`KernelRevision`**: C++ plus an explanation. It may call **`research_algorithm_summary`** for web-backed notes at most once per user message when it needs concrete technical detail.
 
-3. **Guardrail stack** (before trusting eval):
-   - **Static checks** — Fast denylist-style patterns for obvious host-escape primitives (`rules.py` + static pass in `check_reward_hacking_cpp`).
-   - **`GUARDRAIL_AGENT`** — Optional LLM review for injection / edge cases beyond the static list.
-   - **Evaluator (correctness)** — The offline harness: compile, numerical correctness vs `task/reference.py`, then timing when both pass. This is **not** “more injection rules”; it is the task’s correctness and performance contract.
+3. **Guardrail stack** before eval:
+   - **Static checks** — Denylist-style patterns for obvious host-escape primitives in `rules.py` and the static pass inside `check_reward_hacking_cpp`.
+   - **`GUARDRAIL_AGENT`** — Optional LLM pass for injection-style issues beyond the static list.
+   - **Evaluator** — The offline harness: compile, numerical correctness against `task/reference.py`, then timing when both pass. This step is the task’s correctness and performance contract, not another injection pass.
 
-4. **Outcomes** — **Pass** → you get a **new kernel**, profiling fields, and text suitable for history/summary. **Fail guardrails** → the rejection reasons and snippets are **fed back into the next attempt** inside **`run_kernel_turn`** until **max retries** or success (this matches the diagram’s “Triggered = Summary + Retry” loop for injection failures). **Fail eval** (compile or correctness) → the candidate is **not** saved to history; the chat/REPL does **not** auto-retry the same user message—you issue a follow-up—while an improvement cycle inside the manager simply records that branch as failed.
+4. **Outcomes** — On success you get a new kernel, timing fields, and text suitable for history or summarization. **Guardrail failures** feed back into the next attempt inside **`run_kernel_turn`** until success or **`max retries`**, which matches the diagram’s “summary + retry” loop for injection failures. **Eval failure** (compile or correctness) does not append `kernel_history` in the chat or REPL; you send a new message if you want another try. Inside the manager, a failed branch is simply recorded and does not retry automatically.
 
-In code, the guardrail loop is **`run_kernel_turn`**; full cycles with isolated eval are **`improvement_cycle.run_improvement_cycle`** (manager workers).
+In code, guardrail retries live in **`run_kernel_turn`**. Manager workers use **`improvement_cycle.run_improvement_cycle`**, which runs the agent and then evaluates against an isolated candidate module.
 
 ### Manager workflow
 
-![Manager workflow — context, MANAGER_AGENT, parallel instruction cycles, NUM_RUNS, output](Diagram%20Images/IMG_0039.jpg)
+![Manager workflow diagram](Diagram%20Images/IMG_0039.jpg)
 
 **What the diagram shows**
 
-1. **Context** — **Seed kernel(s)** (session, on-disk, baseline, and/or saved revisions), the **user goal** (high-level idea), and **guidelines** encoded in agent instructions (safety, API contract, evaluator behavior).
+1. **Context** — Seed kernels (session, on-disk working kernel, baseline, and/or saved revisions), the user’s goal, and the constraints baked into agent instructions: API shape, safety expectations, and how the evaluator behaves.
 
-2. **`MANAGER_AGENT`** — Expands the goal into **`NUM_PARALLEL`** distinct **worker prompts** for a single “single run” batch.
+2. **`MANAGER_AGENT`** — Turns that goal into **`NUM_PARALLEL`** distinct worker prompts for one batch.
 
-3. **Single run** — Each prompt runs a full **improvement cycle** (MAIN_KERNEL_AGENT → guardrails → eval) **in parallel** with isolated builds. The **best** compile+correct result in that batch (by measured **`candidate_time_ms`**) is **merged into context** for the next round (along with seeds, capped by **`NUM_CAP`**).
+3. **Single run** — Each prompt runs a full improvement cycle—`MAIN_KERNEL_AGENT`, guardrails, then eval—with isolated builds so parallel runs do not overwrite `task/candidate.py`. The fastest compile-and-correct result in that batch, by **`candidate_time_ms`**, is merged into context for the next round together with seeds, subject to **`NUM_CAP`**.
 
-4. **Repeat** — That **single-run** block is repeated **`NUM_RUNS`** times. Failures still consume a run; digest text can inform the next batch’s prompts.
+4. **Repeat** — That batch is repeated **`NUM_RUNS`** times. A round can end with no successful branch; a short digest of failures can influence the next round’s prompts.
 
-5. **Output** — After all runs, the session’s **globally fastest** correct kernel is written to **`kernel_history/`** once (plus optional apply to `task/`), with profiling and explanation—see **Manager session** and **Storing revisions and “best” kernels** below.
+5. **Output** — When everything finishes, the fastest correct kernel over the whole session is written to **`kernel_history/`** once, and `task/` can be updated from that result. Details appear under **Manager session** and **Storing revisions and “best” kernels**.
 
 ### Why this structure?
 
-We kept the design **compartmentalized** so each piece has a clear contract:
+The improvement path is split so responsibilities stay clear:
 
-- **Improvement cycle** — One place (`improvement_cycle.py` + `MAIN_KERNEL_AGENT`) for “turn prompt → structured kernel → safety → eval,” reusable from chat, REPL, or manager workers.
-- **Manager** — A thin orchestration layer (`manager_run.py`, `MANAGER_AGENT`) that does not reimplement GEMM logic; it only plans prompts, fans out parallel cycles, merges winners, and trims context.
+- **`improvement_cycle.py`** and **`MAIN_KERNEL_AGENT`** own one turn: prompt in, structured kernel out, then guardrails and eval. Chat, REPL, and manager workers all call that path.
+- **`manager_run.py`** and **`MANAGER_AGENT`** schedule work only: prompt expansion, parallelism, merging winners, trimming context. They do not embed GEMM knowledge themselves.
 
-**Shared context** is handled explicitly: **summaries** for narrative memory, **multi-kernel C++ stacks** for manager turns (fastest-first, **`NUM_CAP`**), and **failure digests** so later prompts stay diverse. That keeps prompts bounded while still passing forward what mattered from prior attempts.
+Context is shared in three ways: **summaries** for long-running memory in chat, **multi-kernel stacks** for manager turns with a fixed **`NUM_CAP`**, and **failure digests** between manager rounds so later prompts are not copies of the first batch. The intent is to cap prompt size while still carrying forward what mattered.
 
 ## Kernel improver workflow (single chat / REPL turn)
 
-**`main.py`** (REPL) and the **Kernel Agent Chat** tab in **`UI/app.py`** share the same _logical_ pipeline: generate → guardrails → write candidate → evaluate → optional `kernel_history` + promotion. Differences are only in **how prior summary context is chosen** (see **Summaries and `kernel_history/`**).
+The REPL in **`main.py`** and the Kernel Agent Chat tab in **`UI/app.py`** follow the same steps: generate, guardrails, write **`task/candidate.py`**, evaluate, then optionally write **`kernel_history/`** and maybe promote. The only behavioral difference is how prior **summaries** are chosen; see **Summaries and `kernel_history/`**.
 
-1. **Working kernel** — The session starts from `task/best_kernel.py` when it exists, otherwise `task/base_kernel.py` (`load_working_cpp()` in `main.py`). Each successful turn can update the in-memory “current” C++ for the next turn (UI) or the next REPL line (CLI).
-2. **Prior context (summaries)** — Structured **kernel summaries** (tags, notes, high-level description) from selected past runs are injected so the agent can see what was tried before. **REPL:** `get_top_k_summary_context(k)` uses the **K newest** saved files (default `k=3`). **Streamlit:** you pick explicit files via **Chat memory** (see **Streamlit UI**); no fixed “top K.”
-3. **Generation** — **`MAIN_KERNEL_AGENT`** (`agents/MAIN_KERNEL_AGENT.py`) returns a structured **`KernelRevision`**: full `cpp_code` for `CPP_SOURCE` plus an `explanation`.
-4. **Guardrails** — Before any eval, generated C++ is checked for **injection / host-escape** patterns (see **Guardrails** below), not for “disallowed” GEMM APIs. Failed checks trigger retries with the rejection reason and snippet fed back into the prompt, up to **`max_retries`** (env `KERNEL_GUARD_MAX_RETRIES` or the UI **Global settings** control). Exhaustion raises **`GuardrailRetriesExhausted`** (UI surfaces this in a dedicated tab).
-5. **Staging** — Passing C++ is written to **`task/candidate.py`**.
-6. **Evaluator** — **`evaluate_candidate_kernel_sync()`** runs **`sandbox_eval.evaluate_sources`** with **`task/reference.py`** vs **`task/candidate.py`**: compile, multi-trial correctness vs the reference model, then benchmark. Results are **enriched** in `main.py` with naive-baseline fields (see below).
-7. **Persistence** — If compile and correctness pass, a markdown artifact may be written under **`kernel_history/`** (with timing metadata). Promotion to **`task/best_kernel.py`** uses a **separate rule** from the evaluator’s `speedup` vs `torch.matmul` (see **Evaluator and promotion choices**).
-8. **Optional eval skip** — For local development, **`KERNEL_SKIP_EVAL=1`** skips the evaluator; **`KERNEL_SAVE_WITHOUT_EVAL=1`** allows appending history without eval.
+1. **Working kernel** — Start from **`task/best_kernel.py`** if it exists, otherwise **`task/base_kernel.py`** via `load_working_cpp()` in `main.py`. A successful turn updates the current C++ for the next UI message or REPL input.
+2. **Prior context** — Kernel summaries from earlier runs are injected so the agent sees what was tried. The REPL uses **`get_top_k_summary_context(k)`** on the **K** newest saved files, default **K = 3**. The Streamlit app uses **`get_summary_context_for_filenames`** on whichever files you select under Chat memory.
+3. **Generation** — **`MAIN_KERNEL_AGENT`** returns a **`KernelRevision`**: full `cpp_code` for `CPP_SOURCE` and an `explanation`.
+4. **Guardrails** — Before eval, C++ is scanned for injection and host-escape patterns, not for banning particular GEMM styles. Failures retry with structured feedback up to **`max_retries`** from **`KERNEL_GUARD_MAX_RETRIES`** or the UI global guardrail control. Too many failures raise **`GuardrailRetriesExhausted`**; the UI opens a dedicated tab for the trace.
+5. **Staging** — Accepted C++ is written to **`task/candidate.py`**.
+6. **Evaluator** — **`evaluate_candidate_kernel_sync()`** runs **`sandbox_eval.evaluate_sources`** on **`task/reference.py`** and **`task/candidate.py`**: compile, multi-trial correctness against the reference model, then benchmark. `main.py` adds naive-baseline fields for display.
+7. **Persistence** — Compile- and correctness-passing runs can be saved under **`kernel_history/`** with timing metadata. Promotion to **`task/best_kernel.py`** follows the naive-baseline rule in **Evaluator and promotion choices**, not the raw **`speedup`** vs `torch.matmul`.
+8. **Optional eval skip** — **`KERNEL_SKIP_EVAL=1`** skips evaluation for local development. **`KERNEL_SAVE_WITHOUT_EVAL=1`** allows saving history without a successful eval when eval is skipped.
 
 ## Guardrails
 
-**Intent:** Catch **injection attacks** and **sandbox / host escape** in generated C++—not to enforce a “no BLAS / no `torch::matmul`” policy. Normal optimization code (any legitimate API or algorithm) is allowed; the **evaluator** decides correctness and performance vs the reference.
+**Goal:** Block injection-style host escape in generated C++, not to police whether you use a particular GEMM API. Legitimate optimization code is left to the evaluator for correctness and speed.
 
-**Mechanics:**
+**Implementation:**
 
-- **`agents/GUARDRAIL_AGENT/rules.py`** — Small static denylist for **high-confidence** escape primitives (e.g. `system(`, `popen(`, `exec*`, `dlopen(`). No framework matmul / BLAS substring bans.
-- **`GUARDRAIL_AGENT` (LLM)** — Separate small model reviews the full translation unit for semantic injection (shell escape, suspicious dynamic loading, unambiguous instruction-injection text). **On by default**; set **`KERNEL_GUARDRAIL_USE_LLM=0`** to use only static checks. Optional **`KERNEL_GUARDRAIL_MODEL`** overrides the reviewer model (default `gpt-4o-mini`).
-- **`check_reward_hacking_cpp`** (name kept for imports) — Static pass first, then LLM when enabled.
-- **`run_kernel_turn`** — Loops: generate → guardrail → on failure append structured **guardrail feedback** to the next message until pass or max retries.
+- **`agents/GUARDRAIL_AGENT/rules.py`** — Static denylist for high-confidence escape primitives such as `system(`, `popen(`, `exec*`, `dlopen(`. There is no matmul substring ban.
+- **`GUARDRAIL_AGENT`** — Optional small LLM that reads the full translation unit for semantic injection. Enabled by default; **`KERNEL_GUARDRAIL_USE_LLM=0`** restricts to static checks. **`KERNEL_GUARDRAIL_MODEL`** sets the reviewer model if needed; default is `gpt-4o-mini`.
+- **`check_reward_hacking_cpp`** — Historical name; runs static checks first, then the LLM when enabled.
+- **`run_kernel_turn`** — Generates, runs guardrails, and on failure appends structured feedback to the next attempt until pass or **`max_retries`**.
 
-Independent of the **evaluator**: guardrails are a **security-style** pre-filter; the evaluator checks compile/correctness/speed against the harness.
+Guardrails run before the evaluator. They are a security-oriented filter; the evaluator remains the source of truth for compile, correctness, and timing.
 
 ## Manager session (autonomous multi-run)
 
-Separate from the single chat turn, the **Manager** flow in the UI runs **`manager_run.run_manager_session`** (`manager_run.py`). It orchestrates **improvement cycles** (`improvement_cycle.py`): each cycle is **`MAIN_KERNEL_AGENT` → injection guardrails → isolated evaluator**, with **no** write to `kernel_history/` until the **entire** manager session finishes.
+The Manager entry point in the UI calls **`manager_run.run_manager_session`** in `manager_run.py`. Each worker runs **`improvement_cycle.run_improvement_cycle`**: **`MAIN_KERNEL_AGENT`**, injection guardrails, then evaluation in an isolated build. Nothing is written to **`kernel_history/`** until the full manager session completes.
 
-**Why it exists:** explore many directions in parallel ( **`NUM_PARALLEL`** prompts per round) across several rounds (**`NUM_RUNS`**), while growing a **context stack** of C++ bodies (seeds + per-round winners), sorted by fastest measured **`candidate_time_ms`**, capped at **`NUM_CAP`**. The **MANAGER_AGENT** (`agents/MANAGER_AGENT.py`) turns one user “goal” into **`NUM_PARALLEL`** distinct worker prompts each round; failures from a round are summarized for the next round’s prompt diversity.
+**Purpose:** Run **`NUM_PARALLEL`** independent prompts per round for **`NUM_RUNS`** rounds, while keeping a **context stack** of C++ bodies: seeds plus the best result from each round, ordered by **`candidate_time_ms`**, truncated to **`NUM_CAP`**. **`MANAGER_AGENT`** in `agents/MANAGER_AGENT.py` expands one user goal into **`NUM_PARALLEL`** prompts per round. A short summary of failures can shape the next round’s prompts.
 
-**Design choices:**
+**Mechanics:**
 
-- **Isolated evaluation** — Parallel branches cannot all write `task/candidate.py` at once. **`evaluate_candidate_cpp_isolated(cpp, isolate_key)`** in `main.py` builds a **`task/candidate.py`-shaped** module string with a **unique** `load_inline` name and build directory under `build/eval_iso/…`, then calls the same **`evaluate_sources`** contract as the normal path. Each branch gets a unique key so extension builds do not clobber each other.
-- **Multi-kernel context** — When **`manager_context_kernels`** is set, **`MAIN_KERNEL_AGENT`** lists additional kernels as **reference-only**; the **primary** CPP to replace is the fastest in the stack (see **Current CPP_SOURCE** in the built prompt).
-- **Multi-seed** — You can select several seeds (session, on-disk working, baseline, and/or saved files). Each seed is evaluated in isolation once for timing; seeds and run winners are merged, **deduped**, sorted fastest-first, then **`NUM_CAP`** is applied.
-- **One `kernel_history` append per manager session** — Across all runs and all parallel successes, we persist **only the single fastest** compile+correct kernel (if any). It is OK if it is slower than a seed; if **nothing** passes compile+correctness, **nothing** is saved. After save, **`apply_generation_to_task_files`** applies that best kernel to `task/` so the workspace matches the recorded winner.
+- **Isolated evaluation** — Parallel workers cannot share **`task/candidate.py`**. **`evaluate_candidate_cpp_isolated(cpp, isolate_key)`** in `main.py` builds an in-memory module shaped like **`task/candidate.py`** with a unique **`load_inline`** name and build directory under **`build/eval_iso/`**, then calls **`evaluate_sources`** the same way as the normal path. Each isolate key gets its own build artifacts.
+- **Multi-kernel context** — With **`manager_context_kernels`**, **`MAIN_KERNEL_AGENT`** sees extra kernels as reference; the body to replace is the fastest in the stack, repeated in the **Current CPP_SOURCE** block of the prompt.
+- **Multi-seed** — Seeds can come from the session, the on-disk working kernel, baseline, or saved files. Each seed is timed once in isolation; seeds and per-round winners are merged, deduplicated, sorted fastest-first, then cut to **`NUM_CAP`**.
+- **One history file per manager session** — The fastest compile-and-correct kernel across all branches and all rounds is saved once under **`kernel_history/`**. It may be slower than a seed; if no branch passes eval, nothing is saved. **`apply_generation_to_task_files`** then applies that kernel to **`task/`** so the tree matches the saved revision.
 
-**Env:** optional **`MANAGER_AGENT_MODEL`** for the planner; defaults track **`KERNEL_AGENT_MODEL`**.
+Optional **`MANAGER_AGENT_MODEL`** selects the planner model; if unset, it follows **`KERNEL_AGENT_MODEL`**.
 
 ## Summaries and `kernel_history/`
 
-After a revision is saved, a **kernel summary** (tags, notes, high-level description) can be produced and embedded in the markdown file via **`SUMMARY_AGENT`**. Saved files record metadata such as candidate/reference times, evaluator `speedup`, **`naive_baseline_ms`**, **`speedup_vs_naive`**, and **`is_best`** when relevant—so the UI can sort, label, and compare runs without re-running eval.
+Saved revisions can include a **kernel summary** produced by **`SUMMARY_AGENT`**: tags, notes, and a short description embedded in the markdown. Files also store timing metadata such as **`candidate_time_ms`**, **`speedup`**, **`naive_baseline_ms`**, **`speedup_vs_naive`**, and **`is_best`** where applicable so the UI can sort and compare without re-running eval.
 
-**Prior context for the agent is summary text, not full C++** (unless you open a tab and read the file). **`get_summary_context_for_filenames`** (`main.py`) loads or generates summaries for **user-selected** `kernel_history/*.md` names. In the UI, **Chat memory** controls which files are included; among those picks, summaries are ordered **newest file first** (by filesystem mtime) so the prompt order stays stable and aligned with “recent first” semantics. The **REPL** still uses **`get_top_k_summary_context(k)`** (newest-first by filename) for a fixed **K** for non-UI use.
+The agent’s prior context uses **summary text** by default. **`get_summary_context_for_filenames`** in `main.py` loads or generates summaries for the `kernel_history/*.md` names you select in Chat memory. Selected files are ordered **newest first** by modification time. The REPL uses **`get_top_k_summary_context(k)`** on the **K** newest files by filename.
 
 ### Storing revisions and “best” kernels
 
-- **`kernel_history/*.md`** is the **append-only style archive** of revisions that **passed compile + correctness** (unless you use the dev escape hatches for skip-eval saving). Each file is human-readable: metadata lines, explanation, C++ block, then an optional **Kernel Summary** JSON from **`SUMMARY_AGENT`**.
-- **`is_best` in metadata** — Set when the revision was **promoted** under our rule: faster than the profiled naive baseline in **`task/base_kernel.py`** (`should_promote_to_best_kernel`). It does **not** mean “fastest in all of history”; it means “this run earned **`task/best_kernel.py`** at save time.” Revisions can be correct and saved to history but **not** promoted if they are still slower than that naive baseline.
-- **`task/best_kernel.py`** — The **live** promoted kernel used as the default **working** kernel (`load_working_cpp()`). Only the **chat/REPL path** and the **final apply after a manager session** write through **`apply_generation_to_task_files`**, which promotes when the bar is met. **`kernel_history/`** keeps a **broader record** of good runs (including correct-but-not-promoted kernels), which is why history is the right place to pick **chat memory** and compare runs over time.
-- **Manager sessions** — Append **at most one** new markdown file per session: the **single fastest** correct kernel across **all** parallel branches and **all** **`NUM_RUNS`** (see **Manager session**). That file’s **`is_best`** flag still follows the same promotion rule on the global best’s eval metrics.
+- **`kernel_history/*.md`** holds revisions that **passed compile and correctness**, except when you use the skip-eval development flags. Each file has metadata, an explanation, a C++ block, and optionally a **Kernel Summary** JSON from **`SUMMARY_AGENT`**.
+- **`is_best`** in the metadata means the revision was **promoted** to **`task/best_kernel.py`** under **`should_promote_to_best_kernel`**: faster than the profiled naive baseline in **`task/base_kernel.py`**. It does not mean “fastest kernel ever stored,” only that this save promoted the working file. A run can be correct and still appear only in history if it is slower than that baseline.
+- **`task/best_kernel.py`** is what **`load_working_cpp()`** reads by default. Chat, the REPL, and the final step after a manager session go through **`apply_generation_to_task_files`**, which promotes when the rule is satisfied. **`kernel_history/`** keeps a wider set of correct runs, including ones that did not promote, which is why Chat memory reads from history rather than only from **`best_kernel.py`**.
+- **Manager sessions** add at most **one** new markdown file per session: the fastest correct kernel across every parallel branch and every round. **`is_best`** on that file uses the same promotion rule on its eval metrics.
 
 ## Evaluator and promotion choices
 
-**Correctness and timing** — The evaluator always uses **`task/reference.py`** (`torch.matmul`) as the numerical reference. That is the right contract for “does this extension match the reference GEMM?”
+**Reference model** — Evaluation always compares against **`task/reference.py`**, which uses **`torch.matmul`**. That is the correctness and timing reference for “does this extension implement the same GEMM?”
 
-**Why `speedup` ≠ promotion rule** — The same run reports **`speedup` = reference_time_ms / candidate_time_ms** (library vs your kernel). With `torch.matmul` as the reference, naive C++ is vastly _slower_, so this ratio is often near zero. Using **`speedup > 1`** as “promote to best” would mean “beat `torch.matmul`,” which is the wrong bar for this task.
+**`speedup` vs promotion** — The evaluator reports **speedup** as `reference_time_ms / candidate_time_ms`. Because the reference is a highly optimized library call, naive C++ is often much slower than the reference, so **speedup** is often small. Using **speedup > 1** as the promotion rule would effectively require beating **`torch.matmul`**, which is not the goal of this exercise.
 
-**Promotion bar we use** — We profiled the **naive** implementation in **`task/base_kernel.py`** once and store **`NAIVE_BASELINE_TIME_MS`** in `main.py`. We promote to **`task/best_kernel.py`** when compile and correctness pass and **`candidate_time_ms`** is **strictly below** that naive baseline—i.e. the candidate actually improves on the intentional starting point, not on PyTorch’s fused matmul.
+**Promotion rule** — We profiled the naive implementation in **`task/base_kernel.py`** once and store **`NAIVE_BASELINE_TIME_MS`** in `main.py`. **`task/best_kernel.py`** is updated when compile and correctness pass and **`candidate_time_ms`** is **strictly below** that naive baseline. The bar is “faster than our deliberate slow baseline,” not “faster than PyTorch’s matmul.”
 
-**Enriched fields** — After each eval, `main.py` adds **`naive_baseline_ms`** and **`speedup_vs_naive`** (`NAIVE_BASELINE_TIME_MS / candidate_time_ms`) for display, history, and debugging.
+**Extra fields** — After each eval, `main.py` adds **`naive_baseline_ms`** and **`speedup_vs_naive`** for dashboards and history.
 
-**Refreshing the baseline** — If you change `N`, compiler flags, or benchmark env vars, re-profile `base_kernel.py` with the same `evaluate_sources` call and update **`NAIVE_BASELINE_TIME_MS`**.
+**Updating the baseline constant** — If you change problem size **`N`**, compiler flags, or benchmark settings, re-profile **`base_kernel.py`** with the same **`evaluate_sources`** call and replace **`NAIVE_BASELINE_TIME_MS`** accordingly.
 
 ```bash
 python -c "
@@ -157,40 +157,42 @@ Use the printed **`candidate_time_ms`** as the new constant in `main.py`.
 streamlit run UI/app.py
 ```
 
-The UI uses the same **`MAIN_KERNEL_AGENT`**, guardrails, and evaluator path for **Kernel Agent Chat** as the REPL, but organizes controls so **global**, **single-turn**, and **manager** behavior are easy to tell apart.
+The UI uses the same agent, guardrails, and evaluator as the REPL. The sidebar groups global settings, single-turn chat options, and manager options separately.
 
 ### Session
 
-- **Reset to baseline**; open the **current working kernel** in a tab (same file as `load_working_cpp()`).
+- Reset to baseline; open the current working kernel in a tab, which is the same file **`load_working_cpp()`** uses.
 
 ### Global settings
 
-- **Guardrail max retries** — Applies to **both** the chat pipeline and **manager** improvement cycles (still overridable via `KERNEL_GUARD_MAX_RETRIES`; LLM reviewer via `KERNEL_GUARDRAIL_USE_LLM`).
+- **Guardrail max retries** applies to both chat and manager runs. Override with **`KERNEL_GUARD_MAX_RETRIES`**; the LLM guardrail reviewer is controlled by **`KERNEL_GUARDRAIL_USE_LLM`**.
 
 ### Single kernel implementation cycle (chat)
 
-- **Chat memory** — A **Choose memory…** popover lists **saved** `kernel_history` files. Pick any number; their **summaries** are injected into the next chat turns. There is no separate “K” slider: you explicitly choose which past runs matter. Empty selection means **no** extra summaries (only the current kernel body in the prompt).
-- This keeps **intent** clear: memory is opt-in and inspectable (filenames), not an opaque “last K files.”
+- **Chat memory** — The **Choose memory…** control lists saved **`kernel_history`** files. You can select any number; their summaries are injected on the next turns. There is no fixed “top K” slider: you choose the files explicitly. An empty selection means only the current kernel body is in context, with no extra summaries.
 
 ### Manager session
 
-- **`NUM_CAP`** — Maximum number of C++ bodies in the manager context stack (seeds + per-run winners), fastest-first after measurement, then truncated.
-- **`NUM_PARALLEL`** — Parallel improvement cycles per manager round (each with isolated eval).
-- **`NUM_RUNS`** — Number of manager rounds in one session.
-- **Choose seed kernels…** — Same interaction pattern as chat memory: multi-select **session**, **on-disk working**, **baseline**, and/or **saved** revisions. Multiple seeds are timed once each, then merged into the stack with winners.
+- **`NUM_CAP`**: maximum C++ bodies in the manager context stack after sorting and truncation.
+- **`NUM_PARALLEL`**: parallel improvement cycles per round, each with its own isolated eval.
+- **`NUM_RUNS`**: how many rounds to run.
+- **Choose seed kernels…** — Same pattern as chat memory: multi-select session kernel, on-disk working kernel, baseline, and/or saved revisions. Seeds are timed once, then combined with per-round winners.
 
 ### Saved kernels (sidebar list)
 
-- Browse history with timing in labels; sort by recency or fastest candidate time.
-- **⭐** = file is selected for **chat memory** (summaries for the next message), not “newest K by default.”
-- **✅** = working kernel row; **🏆** in file metadata = revision matches **`task/best_kernel.py`**.
+- Lists saved files with timing in the labels; sort by recency or by fastest candidate time.
+- A **star** marker in the list means that file is selected for **chat memory** for the next message.
+- The **working kernel** row opens the on-disk best or baseline file.
+- File metadata can indicate when a revision matches **`task/best_kernel.py`**.
 
 ### Tabs
 
-- **Kernel Agent Chat** — Single-turn loop described above.
-- **Past kernels** — Table-style list with open tab / use kernel actions.
-- **Manager** — Goal text, run button, progress text (run index / phase), session log expander.
-- **Manager log** — Full log buffer for debugging long runs.
+- **Kernel Agent Chat** — Single-turn loop described earlier.
+- **Past kernels** — List with actions to open a detail tab or load a kernel into the session.
+- **Manager** — Goal field, run control, progress, and session log.
+- **Manager log** — Full text log for long runs.
+
+Completed manager results also render **below the tab row** so they stay visible if you switch tabs; see the implementation in **`UI/app.py`** if you need the exact behavior.
 
 ## Folder layout
 
@@ -226,7 +228,7 @@ Preferred approach:
 
 - custom C++ loaded through `torch.utils.cpp_extension`
 
-Word of advice: make sure the agent does not reward-hack. Agents often try to fall back to library calls such as `torch.matmul`, NumPy matmul, or BLAS-backed wrappers. Other times, the agent will try to change the testing harness, be careful with that. The goal here is to generate an actually improved low-level implementation, not a library shortcut or some other reward hack.
+Watch for reward hacking: models may try to call **`torch.matmul`**, NumPy, or BLAS-backed paths instead of keeping work in the extension, or may attempt to alter the harness. The intended outcome is a better low-level implementation in C++, not a shortcut around the task.
 
 ## Setup
 
@@ -286,17 +288,17 @@ Use the same line on **macOS, Windows, and Linux** once the virtual environment 
 pip install -r requirements.txt
 ```
 
-This pulls in **`openai-agents`**, **Streamlit**, **pydantic**, **python-dotenv**, and the other packages listed in `requirements.txt` (including **`numpy`**, **`psutil`**, **`ninja`** for the evaluator).
+This installs **`openai-agents`**, **Streamlit**, **pydantic**, **python-dotenv**, and the rest of **`requirements.txt`**, including **`numpy`**, **`psutil`**, and **`ninja`** for the evaluator.
 
 ### 5. API keys (agents)
 
-Create a **`.env`** file in the repository root (it is gitignored) with your OpenAI API key and any model overrides your setup needs, for example:
+Create a **`.env`** file in the repository root. It should stay out of version control. Put your OpenAI API key and any model overrides there, for example:
 
 ```env
 OPENAI_API_KEY=sk-...
 ```
 
-The agents read this via **`python-dotenv`** in `main.py` / the UI.
+**`main.py`** and the UI load it through **`python-dotenv`**.
 
 ### 6. Start the Streamlit app
 
@@ -306,7 +308,7 @@ With the venv **activated** and your current directory still the repo root:
 streamlit run UI/app.py
 ```
 
-Your browser should open to the Kernel Agent UI. Use **Ctrl+C** in the terminal to stop the server.
+The browser should open to the app. Stop the server with **Ctrl+C** in the terminal.
 
 ### 7. Optional: interactive REPL
 
@@ -314,7 +316,7 @@ Your browser should open to the Kernel Agent UI. Use **Ctrl+C** in the terminal 
 python main.py
 ```
 
-This runs the text **kernel improver loop** in the terminal (same core pipeline as the chat tab, with **top-K** summary context as documented above).
+This runs the interactive kernel improver in the terminal. Summary context uses the **top-K** newest files, as described under **Summaries and `kernel_history/`**.
 
 ## Minimum Requirements
 
@@ -429,10 +431,10 @@ python run_eval.py \
 
 Use **`task/base_kernel.py`** as `--candidate` to measure the naive kernel the same way the harness measures any candidate. The **integrated** agent flow (guardrails → `candidate.py` → `evaluate_candidate_kernel_sync()` → history / promotion) is described under **Kernel improver workflow** and **Evaluator and promotion choices** above.
 
-## Suggested Deliverables
+## Suggested deliverables
 
-- the sandbox or agent setup used
-- the improved C++ implementation
-- a document explaining the workflow and design choices (the sections above are an example of that kind of write-up)
+- The sandbox or agent setup you used
+- The improved C++ implementation
+- A short write-up of workflow and design decisions; this README is one example of that style
 
-Reminder: we are not evaluating how fast you can get this matmul—we are evaluating how well you can set up the agent to optimize it safely and explain your choices.
+The interview emphasizes safe setup and clear reasoning, not raw benchmark scores.
